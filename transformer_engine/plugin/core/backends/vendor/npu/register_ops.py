@@ -143,6 +143,15 @@ def register_builtins(registry) -> None:
             vendor="NPU",
             priority=100,
         ),
+        # Gated Delta Net forward
+        OpImpl(
+            op_name="gated_delta_net_forward",
+            impl_id="vendor.npu.gdn_fwd",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(backend.gated_delta_net_forward, is_avail),
+            vendor="NPU",
+            priority=100,
+        ),
     ]
 
     registry.register_many(impls)

@@ -835,3 +835,53 @@ class NPUBackend(TEFLBackendBase):
 
         _ = math_sm_count  # CUDA-only tuning knob.
         return bias
+
+    # ===================== Gated Delta Net =====================
+
+    def gated_delta_net_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: Optional[torch.Tensor] = None,
+        output_final_state: bool = False,
+        use_qk_l2norm: bool = False,
+        chunk_size: int = 64,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Gated Delta Net forward pass with AscendC optimization.
+
+        This method delegates to the AscendC-optimized GDN implementation
+        for Ascend NPU devices.
+
+        Args:
+            query: Query tensor of shape (batch, seq_len, num_heads, head_dim)
+            key: Key tensor of shape (batch, seq_len, num_heads, head_dim)
+            value: Value tensor of shape (batch, seq_len, num_heads, value_dim)
+            g: Decay tensor of shape (batch, seq_len, num_heads)
+            beta: Beta tensor of shape (batch, seq_len, num_heads)
+            initial_state: Optional initial recurrent state
+            output_final_state: Whether to return the final recurrent state
+            use_qk_l2norm: Whether to apply L2 norm to query and key
+            chunk_size: Size of chunks for processing (default: 64)
+
+        Returns:
+            Tuple of (output, final_state) where:
+            - output: Attention output of shape (batch, seq_len, num_heads, value_dim)
+            - final_state: Optional final recurrent state if output_final_state=True
+        """
+        from .gated_delta_net import gated_delta_net_forward
+
+        return gated_delta_net_forward(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm=use_qk_l2norm,
+            chunk_size=chunk_size,
+        )
