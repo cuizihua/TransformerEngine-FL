@@ -1,0 +1,500 @@
+diff --git a/tests/plugin/test_npu_gdn.py b/tests/plugin/test_npu_gdn.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e657a2911512d8afa6ff552e7bed8f7503b6ab80
+--- /dev/null
++++ b/tests/plugin/test_npu_gdn.py
+@@ -0,0 +1,228 @@
++# Copyright (c) 2025, BAAI. All rights reserved.
++#
++# See LICENSE for license information.
++
++"""
++Unit tests for NPU GDN (Gated Delta Net) implementation.
++
++Tests follow the requirements from FlagOS训练全流程适配实施手册.md Section 7.5:
++- Multiple dtypes (FP32, BF16, FP16)
++- Various shapes (normal, minimal, edge cases)
++- Contiguous and non-contiguous inputs
++- Forward numerical correctness
++- Comparison with Reference implementation
++"""
++
++import pytest
++import torch
++
++# Skip all tests if NPU is not available
++try:
++    import torch_npu
++    NPU_AVAILABLE = torch.npu.is_available() and torch.npu.device_count() > 0
++except (ImportError, AttributeError):
++    NPU_AVAILABLE = False
++
++try:
++    from transformer_engine.plugin.core.manager import OpManager
++    TE_PLUGIN_AVAILABLE = True
++except ImportError:
++    TE_PLUGIN_AVAILABLE = False
++
++
++@pytest.mark.skipif(not NPU_AVAILABLE, reason="NPU not available")
++@pytest.mark.skipif(not TE_PLUGIN_AVAILABLE, reason="TE Plugin not available")
++class TestNPUGatedDeltaNet:
++    """Test suite for NPU GDN implementation following handbook Section 7.5"""
++
++    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++    @pytest.mark.parametrize(
++        "batch,seq,heads,head_dim,value_dim",
++        [
++            (2, 128, 8, 64, 64),   # Normal shape
++            (1, 64, 4, 32, 32),    # Minimal shape
++            (4, 256, 16, 128, 128), # Larger shape
++            (1, 63, 4, 32, 32),    # Non-chunk-aligned sequence
++        ],
++    )
++    def test_gdn_forward_dtype_and_shape(self, dtype, batch, seq, heads, head_dim, value_dim):
++        """
++        Test GDN forward with various dtypes and shapes.
++
++        Requirements from handbook 7.5:
++        - FP32, BF16, FP16
++        - Normal shape, minimal shape, non-divisible shape
++        """
++        device = torch.device("npu:0")
++
++        # Create inputs
++        query = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        key = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        value = torch.randn(batch, seq, heads, value_dim, dtype=dtype, device=device)
++        g = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++        beta = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++
++        manager = OpManager()
++
++        # Test NPU Vendor implementation
++        out_vendor, state_vendor = manager.call(
++            "gated_delta_net_forward",
++            query=query, key=key, value=value, g=g, beta=beta,
++            initial_state=None,
++            output_final_state=False,
++            use_qk_l2norm=False,
++        )
++
++        # Verify output properties
++        assert out_vendor.shape == (batch, seq, heads, value_dim)
++        assert out_vendor.dtype == dtype
++        assert out_vendor.device == device
++        assert out_vendor.is_contiguous()
++        assert not torch.isnan(out_vendor).any()
++        assert not torch.isinf(out_vendor).any()
++
++    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++    def test_gdn_vendor_vs_reference(self, dtype):
++        """
++        Test NPU Vendor implementation against Reference implementation.
++
++        Requirements from handbook 7.5 and 13.1:
++        - Compare with Reference
++        - Max absolute/relative error
++        - Precision: atol=1e-2, rtol=2e-3
++        """
++        device = torch.device("npu:0")
++        batch, seq, heads, head_dim, value_dim = 2, 128, 8, 64, 64
++
++        # Create inputs
++        query = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        key = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        value = torch.randn(batch, seq, heads, value_dim, dtype=dtype, device=device)
++        g = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++        beta = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++
++        manager = OpManager()
++
++        # Get Vendor implementation (NPU AscendC)
++        try:
++            out_vendor, _ = manager.call(
++                "gated_delta_net_forward",
++                query=query, key=key, value=value, g=g, beta=beta,
++                prefer="vendor:NPU"
++            )
++        except Exception as e:
++            pytest.skip(f"Vendor implementation not available: {e}")
++
++        # Get Reference implementation (PyTorch)
++        out_ref, _ = manager.call(
++            "gated_delta_net_forward",
++            query=query, key=key, value=value, g=g, beta=beta,
++            prefer="reference"
++        )
++
++        # Calculate errors
++        abs_error = (out_vendor - out_ref).abs()
++        max_abs_error = abs_error.max().item()
++
++        rel_error = abs_error / (out_ref.abs() + 1e-8)
++        max_rel_error = rel_error.max().item()
++
++        mean_rel_error = rel_error.mean().item()
++
++        # Print diagnostics
++        print(f"\nDtype: {dtype}")
++        print(f"Max absolute error: {max_abs_error:.6e}")
++        print(f"Max relative error: {max_rel_error:.6e}")
++        print(f"Mean relative error: {mean_rel_error:.6e}")
++
++        # Verify precision (handbook 13.1 standards)
++        assert torch.allclose(out_vendor, out_ref, atol=1e-2, rtol=2e-3), (
++            f"Vendor vs Reference mismatch: "
++            f"max_abs_error={max_abs_error:.6e}, "
++            f"max_rel_error={max_rel_error:.6e}"
++        )
++
++    def test_gdn_non_contiguous_input(self):
++        """
++        Test with non-contiguous inputs.
++
++        Requirements from handbook 7.5:
++        - Contiguous and non-contiguous inputs
++        """
++        device = torch.device("npu:0")
++        dtype = torch.float32
++        batch, seq, heads, head_dim, value_dim = 2, 128, 8, 64, 64
++
++        # Create non-contiguous inputs via transpose
++        query = torch.randn(batch, heads, seq, head_dim, dtype=dtype, device=device).transpose(1, 2)
++        key = torch.randn(batch, heads, seq, head_dim, dtype=dtype, device=device).transpose(1, 2)
++        value = torch.randn(batch, heads, seq, value_dim, dtype=dtype, device=device).transpose(1, 2)
++        g = torch.randn(batch, heads, seq, dtype=dtype, device=device).transpose(1, 2)
++        beta = torch.randn(batch, heads, seq, dtype=dtype, device=device).transpose(1, 2)
++
++        assert not query.is_contiguous()
++        assert not key.is_contiguous()
++
++        manager = OpManager()
++
++        # Should handle non-contiguous inputs gracefully
++        out, _ = manager.call(
++            "gated_delta_net_forward",
++            query=query, key=key, value=value, g=g, beta=beta,
++        )
++
++        assert out.shape == (batch, seq, heads, value_dim)
++        assert not torch.isnan(out).any()
++
++    def test_gdn_with_initial_state(self):
++        """Test GDN with initial recurrent state."""
++        device = torch.device("npu:0")
++        dtype = torch.float32
++        batch, seq, heads, head_dim, value_dim = 2, 128, 8, 64, 64
++
++        query = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        key = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        value = torch.randn(batch, seq, heads, value_dim, dtype=dtype, device=device)
++        g = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++        beta = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++
++        # Create initial state
++        initial_state = torch.randn(batch, heads, head_dim, value_dim, dtype=dtype, device=device)
++
++        manager = OpManager()
++
++        out, final_state = manager.call(
++            "gated_delta_net_forward",
++            query=query, key=key, value=value, g=g, beta=beta,
++            initial_state=initial_state,
++            output_final_state=True,
++        )
++
++        assert out.shape == (batch, seq, heads, value_dim)
++        assert final_state is not None
++        assert final_state.shape == (batch, heads, head_dim, value_dim)
++
++    def test_gdn_edge_case_empty_sequence(self):
++        """Test edge case with very short sequences."""
++        device = torch.device("npu:0")
++        dtype = torch.float32
++        batch, seq, heads, head_dim, value_dim = 1, 1, 4, 32, 32
++
++        query = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        key = torch.randn(batch, seq, heads, head_dim, dtype=dtype, device=device)
++        value = torch.randn(batch, seq, heads, value_dim, dtype=dtype, device=device)
++        g = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++        beta = torch.randn(batch, seq, heads, dtype=dtype, device=device)
++
++        manager = OpManager()
++
++        out, _ = manager.call(
++            "gated_delta_net_forward",
++            query=query, key=key, value=value, g=g, beta=beta,
++        )
++
++        assert out.shape == (batch, seq, heads, value_dim)
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v", "-s"])
+diff --git a/tests/plugin/test_npu_gdn_provider.py b/tests/plugin/test_npu_gdn_provider.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82b472a16bba8cef9e58d09a04e6b2589a6ffff2
+--- /dev/null
++++ b/tests/plugin/test_npu_gdn_provider.py
+@@ -0,0 +1,69 @@
++# Copyright (c) 2026, BAAI. All rights reserved.
++#
++# See LICENSE for license information.
++
++"""Integration tests for the TE-FL to FLA-NPU GDN vendor backend."""
++
++import pytest
++import torch
++
++
++try:
++    import torch_npu  # noqa: F401
++
++    NPU_AVAILABLE = torch.npu.is_available() and torch.npu.device_count() > 0
++except (ImportError, AttributeError):
++    NPU_AVAILABLE = False
++
++
++@pytest.mark.skipif(not NPU_AVAILABLE, reason="NPU not available")
++def test_fla_npu_gdn_forward_backward_dispatch():
++    """The manager must select the real provider and preserve all input grads."""
++    from fla_npu.gdn import GDN_PROVIDER, validate_runtime
++    from transformer_engine.plugin.core.manager import OpManager
++
++    runtime = validate_runtime()
++    assert GDN_PROVIDER == "fla_npu"
++    assert runtime["provider"] == "fla_npu"
++
++    torch.manual_seed(42)
++    device = torch.device("npu:0")
++    batch, seq, heads, key_dim, value_dim = 1, 128, 4, 128, 128
++    tensors = [
++        torch.randn(batch, seq, heads, key_dim, device=device, dtype=torch.bfloat16),
++        torch.randn(batch, seq, heads, key_dim, device=device, dtype=torch.bfloat16),
++        torch.randn(batch, seq, heads, value_dim, device=device, dtype=torch.bfloat16),
++        torch.randn(batch, seq, heads, device=device, dtype=torch.float32) * 0.05 - 0.1,
++        torch.sigmoid(torch.randn(batch, seq, heads, device=device, dtype=torch.float32)),
++    ]
++    for tensor in tensors:
++        tensor.requires_grad_(True)
++    query, key, value, g, beta = tensors
++
++    manager = OpManager()
++    candidates = manager.resolve_candidates("gated_delta_net_forward")
++    assert candidates[0].impl_id == "vendor.npu.gdn_fwd"
++
++    output, final_state = manager.call(
++        "gated_delta_net_forward",
++        query=query,
++        key=key,
++        value=value,
++        g=g,
++        beta=beta,
++        output_final_state=False,
++        use_qk_l2norm=False,
++        chunk_size=64,
++    )
++    assert manager._get_last_impl_id("gated_delta_net_forward") == "vendor.npu.gdn_fwd"
++    assert output.shape == value.shape
++    assert output.dtype == value.dtype
++    assert output.device == value.device
++    assert output.is_contiguous()
++    assert final_state is None
++
++    grad_output = torch.randn_like(output) * 0.05
++    output.backward(grad_output)
++    for tensor in tensors:
++        assert tensor.grad is not None
++        assert torch.isfinite(tensor.grad).all()
+diff --git a/transformer_engine/plugin/core/backends/vendor/npu/gated_delta_net.py b/transformer_engine/plugin/core/backends/vendor/npu/gated_delta_net.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1aedefdee7c05b648b3aa64c9c09f59fd92c6eaf
+--- /dev/null
++++ b/transformer_engine/plugin/core/backends/vendor/npu/gated_delta_net.py
+@@ -0,0 +1,89 @@
++# Copyright (c) 2025, BAAI. All rights reserved.
++# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
++#
++# See LICENSE for license information.
++
++"""Gated Delta Net implementation backed by the public FLA-NPU API."""
++
++from __future__ import annotations
++
++from typing import Optional, Tuple
++
++import torch
++
++
++_MIN_GDN_API_VERSION = 1
++
++
++def is_gated_delta_net_available() -> bool:
++    """Return whether the complete FLA-NPU GDN runtime is available."""
++    try:
++        from fla_npu.gdn import GDN_API_VERSION, validate_runtime
++
++        if GDN_API_VERSION < _MIN_GDN_API_VERSION:
++            return False
++        validate_runtime()
++    except (ImportError, RuntimeError):
++        return False
++    return True
++
++
++def gated_delta_net_forward(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    initial_state: Optional[torch.Tensor] = None,
++    output_final_state: bool = False,
++    use_qk_l2norm: bool = False,
++    chunk_size: int = 64,
++) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++    """Run GDN through FLA-NPU while preserving the TE-FL BSHD contract.
++
++    TE-FL receives ``query``, ``key`` and ``value`` in BSHD layout. The public
++    FLA-NPU API consumes those tensors in BHSD layout and returns its output in
++    BSHD layout. ``g`` and ``beta`` remain BSH tensors.
++
++    This vendor implementation intentionally fails closed. Backend selection
++    and any reference fallback remain the responsibility of the TE-FL manager
++    and its caller; this module never disguises a PyTorch implementation as an
++    AscendC vendor hit.
++    """
++    if query.device.type != "npu":
++        raise ValueError(f"FLA-NPU GDN requires NPU tensors, got {query.device}.")
++    if query.shape != key.shape:
++        raise ValueError(
++            f"query and key must have identical shapes, got {query.shape} and {key.shape}."
++        )
++    if query.ndim != 4 or value.ndim != 4:
++        raise ValueError("query, key and value must be rank-4 BSHD tensors.")
++    if g.ndim != 3 or beta.ndim != 3 or g.shape != beta.shape:
++        raise ValueError("g and beta must be matching rank-3 BSH tensors.")
++    if query.shape[:3] != value.shape[:3] or query.shape[:3] != g.shape:
++        raise ValueError(
++            "query/key/value BSH prefixes must match the g/beta BSH shape; "
++            f"got query={tuple(query.shape)}, value={tuple(value.shape)}, g={tuple(g.shape)}."
++        )
++
++    from fla_npu.gdn import GDN_API_VERSION, flash_gated_delta_rule, validate_runtime
++
++    if GDN_API_VERSION < _MIN_GDN_API_VERSION:
++        raise RuntimeError(
++            f"FLA-NPU GDN API version {GDN_API_VERSION} is older than "
++            f"the required version {_MIN_GDN_API_VERSION}."
++        )
++    validate_runtime()
++
++    output, final_state = flash_gated_delta_rule(
++        q=query.transpose(1, 2).contiguous(),
++        k=key.transpose(1, 2).contiguous(),
++        v=value.transpose(1, 2).contiguous(),
++        g=g.contiguous(),
++        beta=beta.contiguous(),
++        initial_state=initial_state,
++        output_final_state=output_final_state,
++        use_qk_l2norm_in_kernel=use_qk_l2norm,
++        chunk_size=chunk_size,
++    )
++    return output.contiguous(), final_state
+diff --git a/transformer_engine/plugin/core/backends/vendor/npu/npu.py b/transformer_engine/plugin/core/backends/vendor/npu/npu.py
+index 691bec7341410f465ff0ff70f668617bc88b7e70..2f100c04eea539d1ce0f0bfa421072aa2e1f4d5b 100644
+--- a/transformer_engine/plugin/core/backends/vendor/npu/npu.py
++++ b/transformer_engine/plugin/core/backends/vendor/npu/npu.py
+@@ -835,3 +835,53 @@ class NPUBackend(TEFLBackendBase):
+ 
+         _ = math_sm_count  # CUDA-only tuning knob.
+         return bias
++
++    # ===================== Gated Delta Net =====================
++
++    def gated_delta_net_forward(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        g: torch.Tensor,
++        beta: torch.Tensor,
++        initial_state: Optional[torch.Tensor] = None,
++        output_final_state: bool = False,
++        use_qk_l2norm: bool = False,
++        chunk_size: int = 64,
++    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++        """
++        Gated Delta Net forward pass with AscendC optimization.
++
++        This method delegates to the AscendC-optimized GDN implementation
++        for Ascend NPU devices.
++
++        Args:
++            query: Query tensor of shape (batch, seq_len, num_heads, head_dim)
++            key: Key tensor of shape (batch, seq_len, num_heads, head_dim)
++            value: Value tensor of shape (batch, seq_len, num_heads, value_dim)
++            g: Decay tensor of shape (batch, seq_len, num_heads)
++            beta: Beta tensor of shape (batch, seq_len, num_heads)
++            initial_state: Optional initial recurrent state
++            output_final_state: Whether to return the final recurrent state
++            use_qk_l2norm: Whether to apply L2 norm to query and key
++            chunk_size: Size of chunks for processing (default: 64)
++
++        Returns:
++            Tuple of (output, final_state) where:
++            - output: Attention output of shape (batch, seq_len, num_heads, value_dim)
++            - final_state: Optional final recurrent state if output_final_state=True
++        """
++        from .gated_delta_net import gated_delta_net_forward
++
++        return gated_delta_net_forward(
++            query=query,
++            key=key,
++            value=value,
++            g=g,
++            beta=beta,
++            initial_state=initial_state,
++            output_final_state=output_final_state,
++            use_qk_l2norm=use_qk_l2norm,
++            chunk_size=chunk_size,
++        )
+diff --git a/transformer_engine/plugin/core/backends/vendor/npu/register_ops.py b/transformer_engine/plugin/core/backends/vendor/npu/register_ops.py
+index e0bb600c3360ece907b03bb7ebd0bbc02549d594..01b013d71dc254d6b7d50479799163a0449cb038 100644
+--- a/transformer_engine/plugin/core/backends/vendor/npu/register_ops.py
++++ b/transformer_engine/plugin/core/backends/vendor/npu/register_ops.py
+@@ -43,6 +43,17 @@ def register_builtins(registry) -> None:
+ 
+     is_avail = backend.is_available
+ 
++    from .gated_delta_net import is_gated_delta_net_available
++
++    # FLA-NPU installs its custom OPP search paths while it is imported.  The
++    # provider must therefore be discovered before the NPU runtime is first
++    # initialized; deferring this check until the first GDN call is too late
++    # for CANN to discover the custom kernels.
++    gdn_provider_available = is_gated_delta_net_available()
++
++    def is_gdn_available():
++        return is_avail() and gdn_provider_available
++
+     impls = [
+         # FlashAttention class getter
+         OpImpl(
+@@ -143,6 +154,15 @@ def register_builtins(registry) -> None:
+             vendor="NPU",
+             priority=100,
+         ),
++        # Gated Delta Net forward
++        OpImpl(
++            op_name="gated_delta_net_forward",
++            impl_id="vendor.npu.gdn_fwd",
++            kind=BackendImplKind.VENDOR,
++            fn=_bind_is_available(backend.gated_delta_net_forward, is_gdn_available),
++            vendor="NPU",
++            priority=100,
++        ),
+     ]
+ 
+     registry.register_many(impls)

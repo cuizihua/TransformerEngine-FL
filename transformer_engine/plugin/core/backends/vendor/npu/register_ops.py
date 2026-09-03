@@ -43,6 +43,17 @@ def register_builtins(registry) -> None:
 
     is_avail = backend.is_available
 
+    from .gated_delta_net import is_gated_delta_net_available
+
+    # FLA-NPU installs its custom OPP search paths while it is imported.  The
+    # provider must therefore be discovered before the NPU runtime is first
+    # initialized; deferring this check until the first GDN call is too late
+    # for CANN to discover the custom kernels.
+    gdn_provider_available = is_gated_delta_net_available()
+
+    def is_gdn_available():
+        return is_avail() and gdn_provider_available
+
     impls = [
         # FlashAttention class getter
         OpImpl(
@@ -148,7 +159,7 @@ def register_builtins(registry) -> None:
             op_name="gated_delta_net_forward",
             impl_id="vendor.npu.gdn_fwd",
             kind=BackendImplKind.VENDOR,
-            fn=_bind_is_available(backend.gated_delta_net_forward, is_avail),
+            fn=_bind_is_available(backend.gated_delta_net_forward, is_gdn_available),
             vendor="NPU",
             priority=100,
         ),
