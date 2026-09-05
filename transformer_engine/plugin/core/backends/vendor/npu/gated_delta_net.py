@@ -178,6 +178,7 @@ def _torch_chunk_gated_delta_rule(
 
 def gated_delta_net_forward(
     query: torch.Tensor,
+    key: torch.Tensor,
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,

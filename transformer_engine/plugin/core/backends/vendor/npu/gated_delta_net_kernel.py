@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 # Force set FLA-NPU environment variables before any other imports
-os.environ.setdefault('FLAGOS_FLA_NPU_SOURCE_ROOT', '/data/flash-linear-attention-npu')
-os.environ.setdefault('FLAGOS_FLA_NPU_DIRECT_ROOT', '/data/tiankuan/czh/mindspeed/flash-linear-attention-npu/build/lib')
+os.environ.setdefault('FLAGOS_FLA_NPU_SOURCE_ROOT', '/data/tiankuan/tk-czh/flash-linear-attention-npu')
+os.environ.setdefault('FLAGOS_FLA_NPU_DIRECT_ROOT', '/data/tiankuan/tk-czh/flash-linear-attention-npu/torch_custom/fla_npu/build/lib.linux-aarch64-cpython-312')
 
 import torch
 
